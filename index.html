@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>바다 위의 전투기</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #d8dce0; font-family: sans-serif; }
+  canvas { display: block; }
+  #overlay { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #overlay line { stroke: #333; stroke-width: 1; }
+  .dot {
+    position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px;
+    border: 1.5px solid #222; border-radius: 50%; background: rgba(255,255,255,.92);
+    display: none; align-items: center; justify-content: center; cursor: pointer;
+  }
+  .dot::after { content: ""; width: 5px; height: 5px; border-radius: 50%; background: #222; }
+  .tag {
+    position: absolute; transform: translateY(-50%); padding: 6px 14px;
+    border: 1px solid #bbb; border-radius: 999px; background: #fff; color: #222;
+    font-size: 14px; white-space: nowrap; cursor: pointer; display: none;
+    box-shadow: 0 2px 6px rgba(0,0,0,.1);
+  }
+  #hint {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+    color: #fff; background: rgba(0,0,0,.4); padding: 8px 14px; border-radius: 999px;
+    font-size: 13px; pointer-events: none; transition: opacity .4s; white-space: nowrap;
+  }
+  #back {
+    position: fixed; left: 16px; top: 16px; padding: 8px 14px; border: 0;
+    border-radius: 999px; background: rgba(255,255,255,.92); cursor: pointer; display: none;
+  }
+  #modal {
+    position: fixed; inset: 0; display: none; place-items: center;
+    background: rgba(0,0,0,.35); z-index: 10;
+  }
+  #modal .box {
+    background: #fff; width: calc(100% - 40px); max-width: 480px; max-height: 80vh;
+    overflow-y: auto; padding: 24px; border-radius: 12px; line-height: 1.7;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<svg id="overlay"></svg>
+<button id="back">← 돌아가기</button>
+<div id="hint">전투기를 눌러 보세요</div>
+<div id="modal"><div class="box" id="modalBox"></div></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+/* ───────── 설정 ───────── */
+const EYE = new THREE.Vector3(0, 1.7, 0);
+const LOOK_PITCH = THREE.MathUtils.degToRad(8);
+const HOME_LOOK = new THREE.Vector3(0, EYE.y + Math.sin(LOOK_PITCH) * 40, -Math.cos(LOOK_PITCH) * 40);
+const PLANE_DIST = 40;
+const ANIM_TIME = 2.8;
+
+// 기수 방향: 사진 2 구도 (기수가 화면 왼쪽 아래, 꼬리가 오른쪽 위)
+// 모델 기수는 +X 방향이므로, 화면 왼쪽 아래(-X, +Z 쪽 깊이)를 향하도록 회전
+const FWD   = new THREE.Vector3(-0.8, 0, 0.6).normalize();
+const YAW   = Math.atan2(-FWD.z, FWD.x);
+// 확대 시선: 전투기 오른쪽 옆에서 약간 앞쪽, 살짝 위 (사진처럼 기수가 왼쪽 아래로 보이는 각도)
+const RIGHT = new THREE.Vector3(-FWD.z, 0, FWD.x).normalize();
+const FINAL_DIR = RIGHT.clone().multiplyScalar(0.7)
+  .addScaledVector(FWD, 0.3)
+  .add(new THREE.Vector3(0, 0.4, 0))
+  .normalize();
+
+// 핫스팟: pos는 전투기 모델 기준 좌표, dx/dy는 라벨 오프셋(px)
+const HOTSPOTS = [
+  { title: 'info',    pos: [1.9,  0.15, 0.0],   dx: -170, dy: -110, text: '첫 번째 내용을 여기에 적으세요.' },
+  { title: 'caution', pos: [-0.7, 0.05, -2.2],  dx: -170, dy:  110, text: '두 번째 내용을 여기에 적으세요.' },
+  { title: '名1',     pos: [-1.6, 1.0, 0.35],   dx:  170, dy: -110, text: '세 번째 내용을 여기에 적으세요.' },
+  { title: 'fyi',     pos: [0.9,  0.35, 0.0],   dx:  170, dy:  110, text: '네 번째 내용을 여기에 적으세요.' },
+];
+/* ─────────────────────── */
+
+const isPortrait = () => innerWidth < innerHeight;
+
+/* ───────── 렌더러 / 씬 / 카메라 ───────── */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const FOG_COLOR = 0xd0d5da;
+scene.fog = new THREE.Fog(FOG_COLOR, 80, 1000);
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 2000);
+const lookCur = HOME_LOOK.clone();
+
+function computePlaneCenter() {
+  camera.position.copy(EYE);
+  camera.lookAt(HOME_LOOK);
+  camera.updateMatrixWorld();
+  camera.updateProjectionMatrix();
+  const ndcX = isPortrait() ? 0.28 : 0.38;
+  const ndcY = 0.32;
+  const p = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(camera);
+  const dir = p.sub(EYE).normalize();
+  return EYE.clone().addScaledVector(dir, PLANE_DIST);
+}
+let PLANE_C = computePlaneCenter();
+
+camera.position.copy(EYE);
+camera.lookAt(lookCur);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x4a5056, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.3);
+sun.position.set(-6, 12, 6);
+scene.add(sun);
+
+/* ───────── 하늘 ───────── */
+function makeSkyTexture() {
+  const c = document.createElement('canvas');
+  c.width = 4; c.height = 512;
+  const ctx = c.getContext('2d');
+  const g = ctx.createLinearGradient(0, 0, 0, 512);
+  g.addColorStop(0, '#8d959c');
+  g.addColorStop(0.5, '#cfd4d8');
+  g.addColorStop(1, '#d0d5da');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 4, 512);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(1000, 32, 16),
+  new THREE.MeshBasicMaterial({ map: makeSkyTexture(), side: THREE.BackSide, fog: false, depthWrite: false })
+);
+scene.add(sky);
+
+/* ───────── 구름 (부드러운 띠, 천천히 흐름) ───────── */
+function hash2(ix, iy) {
+  let h = (ix * 127 + iy * 311) | 0;
+  h = Math.imul(h ^ (h >>> 13), 0x5bd1e995);
+  h ^= h >>> 15;
+  return (h >>> 0) / 4294967296;
+}
+function vnoise(x, y, px) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const x0 = ((xi % px) + px) % px, x1 = (x0 + 1) % px;
+  const a = hash2(x0, yi), b = hash2(x1, yi), c = hash2(x0, yi + 1), d = hash2(x1, yi + 1);
+  const top = a + (b - a) * u, bot = c + (d - c) * u;
+  return top + (bot - top) * v;
+}
+function smoothstep(e0, e1, x) {
+  const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1);
+  return t * t * (3 - 2 * t);
+}
+function makeCloudTexture() {
+  const W = 512, H = 256;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(W, H);
+  const d = img.data;
+  for (let y = 0; y < H; y++) {
+    const v = y / H;
+    const fade = Math.pow(Math.sin(Math.PI * v), 0.8);
+    for (let x = 0; x < W; x++) {
+      const u = x / W;
+      let s = 0, amp = 1, tot = 0;
+      for (let k = 0; k < 5; k++) {
+        const f = 1 << k, px = 4 * f;
+        s += amp * vnoise(u * px, v * 4 * f, px);
+        tot += amp; amp *= 0.5;
+      }
+      const dens = smoothstep(0.48, 0.74, s / tot);
+      const i = (y * W + x) * 4;
+      d[i] = 250; d[i + 1] = 251; d[i + 2] = 252;
+      d[i + 3] = dens * fade * 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = THREE.RepeatWrapping;
+  t.wrapT = THREE.ClampToEdgeWrapping;
+  return t;
+}
+const cloudTex = makeCloudTexture();
+const cloudFar = new THREE.Mesh(
+  new THREE.PlaneGeometry(1400, 380),
+  new THREE.MeshBasicMaterial({ map: cloudTex, transparent: true, depthWrite: false, opacity: 0.85, fog: false })
+);
+cloudFar.position.set(0, 140, -420);
+scene.add(cloudFar);
+
+const cloudTex2 = cloudTex.clone();
+cloudTex2.repeat.set(2, 1);
+cloudTex2.needsUpdate = true;
+const cloudNear = new THREE.Mesh(
+  new THREE.PlaneGeometry(1200, 220),
+  new THREE.MeshBasicMaterial({ map: cloudTex2, transparent: true, depthWrite: false, opacity: 0.6, fog: false })
+);
+cloudNear.position.set(0, 70, -300);
+scene.add(cloudNear);
+
+/* ───────── 바다 (노멀맵 + 완만한 너울) ───────── */
+function tnoise(x, y, p) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const x0 = ((xi % p) + p) % p, x1 = (x0 + 1) % p;
+  const y0 = ((yi % p) + p) % p, y1 = (y0 + 1) % p;
+  const a = hash2(x0, y0), b = hash2(x1, y0), c = hash2(x0, y1), d = hash2(x1, y1);
+  const top = a + (b - a) * u, bot = c + (d - c) * u;
+  return top + (bot - top) * v;
+}
+function makeWaterNormalTexture() {
+  const N = 256;
+  const h = new Float32Array(N * N);
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      let s = 0, amp = 1, tot = 0;
+      for (let k = 0; k < 5; k++) {
+        const p = 4 << k;
+        const n = tnoise(x / N * p, y / N * p, p);
+        const ridged = 1 - Math.abs(n * 2 - 1);
+        s += amp * (k < 2 ? n : ridged);
+        tot += amp; amp *= 0.55;
+      }
+      h[y * N + x] = s / tot;
+    }
+  }
+  const data = new Uint8Array(N * N * 4);
+  const STRENGTH = 7;
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const hL = h[y * N + ((x - 1 + N) % N)], hR = h[y * N + ((x + 1) % N)];
+      const hU = h[((y - 1 + N) % N) * N + x], hD = h[((y + 1) % N) * N + x];
+      const dx = (hR - hL) * STRENGTH, dy = (hD - hU) * STRENGTH;
+      const nx = -dx, ny = -dy, nz = 1;
+      const len = Math.hypot(nx, ny, nz);
+      const i = (y * N + x) * 4;
+      data[i]     = (nx / len * 0.5 + 0.5) * 255;
+      data[i + 1] = (ny / len * 0.5 + 0.5) * 255;
+      data[i + 2] = (nz / len * 0.5 + 0.5) * 255;
+      data[i + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.repeat.set(90, 90);
+  tex.needsUpdate = true;
+  return tex;
+}
+const waterNormal = makeWaterNormalTexture();
+
+const SEA_SIZE = 1400, SEG = 240;
+const seaGeo = new THREE.PlaneGeometry(SEA_SIZE, SEA_SIZE, SEG, SEG);
+seaGeo.rotateX(-Math.PI / 2);
+const seaBase = seaGeo.attributes.position.array.slice();
+const sea = new THREE.Mesh(seaGeo, new THREE.MeshStandardMaterial({
+  color: 0x5a6268,
+  roughness: 0.14,
+  metalness: 0.0,
+  normalMap: waterNormal,
+  normalScale: new THREE.Vector2(0.9, 0.9),
+  envMapIntensity: 1.2,
+}));
+scene.add(sea);
+
+function swellY(x, z, t) {
+  return Math.sin(x * 0.045 + t * 0.55) * 0.22
+       + Math.sin(z * 0.06 - t * 0.42) * 0.16
+       + Math.sin((x * 0.6 + z * 0.8) * 0.12 + t * 0.9) * 0.07;
+}
+
+/* ───────── 공군 전투기 모델 (절차적 생성, 기수는 +X 방향) ───────── */
+function makeFighter() {
+  const g = new THREE.Group();
+
+  const body = new THREE.MeshStandardMaterial({ color: 0x3a3e44, metalness: 0.55, roughness: 0.35, side: THREE.DoubleSide });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x17191c, metalness: 0.4, roughness: 0.5, side: THREE.DoubleSide });
+  const panel = new THREE.MeshStandardMaterial({ color: 0x4a4f57, metalness: 0.5, roughness: 0.4 });
+  const glass = new THREE.MeshStandardMaterial({ color: 0x1b2a38, metalness: 0.9, roughness: 0.05, envMapIntensity: 1.5 });
+  const red = new THREE.MeshBasicMaterial({ color: 0xff3b30 });
+  const green = new THREE.MeshBasicMaterial({ color: 0x34d058 });
+  const white = new THREE.MeshBasicMaterial({ color: 0xf2f2f2 });
+
+  const prof = [
+    [0.00, 2.70], [0.05, 2.62], [0.12, 2.40], [0.20, 2.10], [0.27, 1.75],
+    [0.33, 1.35], [0.38, 0.90], [0.41, 0.40], [0.41, -0.20], [0.39, -0.80],
+    [0.34, -1.40], [0.28, -1.90], [0.22, -2.30], [0.18, -2.45], [0.00, -2.50],
+  ].map(([r, y]) => new THREE.Vector2(r, y));
+  const fus = new THREE.LatheGeometry(prof, 40);
+  fus.rotateZ(-Math.PI / 2);
+  fus.scale(1, 0.8, 1);
+  g.add(new THREE.Mesh(fus, body));
+
+  const intake = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.22, 0.7), dark);
+  intake.position.set(0.7, -0.38, 0);
+  g.add(intake);
+  const intakeLip = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.05, 0.76), panel);
+  intakeLip.position.set(0.7, -0.27, 0);
+  g.add(intakeLip);
+
+  const wingShape = new THREE.Shape();
+  wingShape.moveTo(0.9, 0.25);
+  wingShape.lineTo(-0.7, 2.45);
+  wingShape.lineTo(-1.55, 2.45);
+  wingShape.lineTo(-1.35, 0.3);
+  wingShape.lineTo(-1.35, -0.3);
+  wingShape.lineTo(-1.55, -2.45);
+  wingShape.lineTo(-0.7, -2.45);
+  wingShape.lineTo(0.9, -0.25);
+  wingShape.closePath();
+  const wingGeo = new THREE.ExtrudeGeometry(wingShape, {
+    depth: 0.05, bevelEnabled: true, bevelThickness: 0.015, bevelSize: 0.02, bevelSegments: 2,
+  });
+  wingGeo.translate(0, 0, -0.025);
+  wingGeo.rotateX(-Math.PI / 2);
+  const wing = new THREE.Mesh(wingGeo, body);
+  wing.position.set(0, -0.12, 0);
+  g.add(wing);
+
+  for (const s of [-1, 1]) {
+    const strip = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.012, 0.05), dark);
+    strip.position.set(-0.2, -0.105, s * 1.2);
+    g.add(strip);
+  }
+
+  const finShape = new THREE.Shape();
+  finShape.moveTo(0.4, 0.0);
+  finShape.lineTo(-0.5, 1.35);
+  finShape.lineTo(-0.95, 1.45);
+  finShape.lineTo(-0.8, 0.0);
+  finShape.closePath();
+  const finGeo = new THREE.ExtrudeGeometry(finShape, {
+    depth: 0.05, bevelEnabled: true, bevelThickness: 0.01, bevelSize: 0.015, bevelSegments: 1,
+  });
+  finGeo.translate(0, 0, -0.025);
+  for (const s of [-1, 1]) {
+    const f = new THREE.Mesh(finGeo, body);
+    f.position.set(-1.25, 0.1, s * 0.22);
+    f.rotation.x = s * 0.14;
+    g.add(f);
+  }
+
+  const stabShape = new THREE.Shape();
+  stabShape.moveTo(-0.9, 0.1);
+  stabShape.lineTo(-1.7, 0.95);
+  stabShape.lineTo(-2.0, 0.95);
+  stabShape.lineTo(-1.95, 0.1);
+  stabShape.closePath();
+  const stabGeo = new THREE.ExtrudeGeometry(stabShape, { depth: 0.04, bevelEnabled: false });
+  stabGeo.translate(0, 0, -0.02);
+  stabGeo.rotateX(-Math.PI / 2);
+  const stab = new THREE.Mesh(stabGeo, body);
+  stab.position.set(0, 0.02, 0);
+  g.add(stab);
+
+  const canopy = new THREE.Mesh(new THREE.SphereGeometry(0.3, 28, 18), glass);
+  canopy.scale.set(2.1, 0.7, 0.85);
+  canopy.position.set(1.05, 0.28, 0);
+  g.add(canopy);
+
+  const frame = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.04, 0.06), dark);
+  frame.position.set(1.0, 0.45, 0);
+  frame.rotation.z = -0.2;
+  g.add(frame);
+
+  for (const s of [-1, 1]) {
+    const outer = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.16, 0.45, 28, 1, true), dark);
+    outer.rotation.z = -Math.PI / 2;
+    outer.position.set(-2.55, -0.02, s * 0.2);
+    g.add(outer);
+
+    const inner = new THREE.Mesh(new THREE.CircleGeometry(0.15, 24), new THREE.MeshBasicMaterial({ color: 0x1a0d08 }));
+    inner.rotation.y = Math.PI / 2;
+    inner.position.set(-2.78, -0.02, s * 0.2);
+    g.add(inner);
+  }
+
+  const missileGeo = new THREE.CylinderGeometry(0.06, 0.06, 1.5, 14);
+  missileGeo.rotateZ(Math.PI / 2);
+  const noseGeo = new THREE.ConeGeometry(0.06, 0.2, 14);
+  noseGeo.rotateZ(-Math.PI / 2);
+  for (const s of [-1, 1]) {
+    for (const x of [0.3, -0.5]) {
+      const pylon = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.12, 0.06), dark);
+      pylon.position.set(x, -0.2, s * 1.25);
+      g.add(pylon);
+
+      const m = new THREE.Mesh(missileGeo, panel);
+      m.position.set(x, -0.3, s * 1.25);
+      g.add(m);
+
+      const tip = new THREE.Mesh(noseGeo, dark);
+      tip.position.set(x + 0.85, -0.3, s * 1.25);
+      g.add(tip);
+
+      const fin = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.14, 0.02), dark);
+      fin.position.set(x - 0.6, -0.3, s * 1.25);
+      g.add(fin);
+    }
+  }
+
+  const navRed = new THREE.Mesh(new THREE.SphereGeometry(0.035, 10, 8), red);
+  navRed.position.set(-0.7, 0.02, -2.45);
+  g.add(navRed);
+  const navGreen = new THREE.Mesh(new THREE.SphereGeometry(0.035, 10, 8), green);
+  navGreen.position.set(-0.7, 0.02, 2.45);
+  g.add(navGreen);
+
+  const marking = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.05, 0.02), white);
+  marking.position.set(1.4, 0.05, 0.42);
+  g.add(marking);
+
+  return g;
+}
+
+const planeRoot = new THREE.Group();
+planeRoot.position.copy(PLANE_C);
+planeRoot.rotation.y = YAW;
+scene.add(planeRoot);
+
+const planeBody = new THREE.Group();
+planeRoot.add(planeBody);
+planeBody.add(makeFighter());
+
+const hitMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(3.2, 12, 8),
+  new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false })
+);
+planeRoot.add(hitMesh);
+
+/* ───────── 핫스팟 (확대 후에만 표시) ───────── */
+const overlay = document.getElementById('overlay');
+const svgNS = 'http://www.w3.org/2000/svg';
+const modal = document.getElementById('modal');
+const modalBox = document.getElementById('modalBox');
+const backBtn = document.getElementById('back');
+const hint = document.getElementById('hint');
+
+const hotspotEls = HOTSPOTS.map(h => {
+  const line = document.createElementNS(svgNS, 'line');
+  overlay.appendChild(line);
+
+  const dot = document.createElement('div');
+  dot.className = 'dot';
+  document.body.appendChild(dot);
+
+  const tag = document.createElement('div');
+  tag.className = 'tag';
+  tag.textContent = h.title;
+  document.body.appendChild(tag);
+
+  const open = e => {
+    e.stopPropagation();
+    modalBox.innerHTML = `<h2>${h.title}</h2><p>${h.text}</p>`;
+    modal.style.display = 'grid';
+  };
+  dot.addEventListener('click', open);
+  tag.addEventListener('click', open);
+
+  return { h, line, dot, tag, world: new THREE.Vector3() };
+});
+
+modal.addEventListener('click', () => { modal.style.display = 'none'; });
+
+function hideHotspots() {
+  hotspotEls.forEach(({ line, dot, tag }) => {
+    line.style.display = 'none';
+    dot.style.display = 'none';
+    tag.style.display = 'none';
+  });
+}
+
+function updateHotspots() {
+  const w = innerWidth, hgt = innerHeight;
+  hotspotEls.forEach(({ h, line, dot, tag, world }) => {
+    world.set(...h.pos);
+    planeBody.localToWorld(world);
+    const p = world.clone().project(camera);
+    const visible = p.z < 1;
+    const d = visible ? '' : 'none';
+    line.style.display = dot.style.display = tag.style.display = d;
+    if (!visible) return;
+    const x = (p.x * 0.5 + 0.5) * w;
+    const y = (-p.y * 0.5 + 0.5) * hgt;
+    const tx = x + h.dx, ty = y + h.dy;
+    dot.style.left = x + 'px';  dot.style.top = y + 'px';
+    tag.style.left = tx + 'px'; tag.style.top = ty + 'px';
+    line.setAttribute('x1', x);  line.setAttribute('y1', y);
+    line.setAttribute('x2', tx); line.setAttribute('y2', ty);
+  });
+}
+
+/* ───────── 카메라 상태 & 전환 ───────── */
+let zoomed = false;
+let anim = null;
+
+function homeState() {
+  return { pos: EYE.clone(), look: HOME_LOOK.clone() };
+}
+function zoomDist() {
+  const t = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  const aspect = innerWidth / innerHeight;
+  return Math.max(7.5, 6.0 / (2 * t * aspect));
+}
+function zoomState() {
+  const d = zoomDist();
+  return {
+    pos: PLANE_C.clone().addScaledVector(FINAL_DIR, d),
+    look: PLANE_C.clone(),
+  };
+}
+function topState() {
+  const d = zoomDist();
+  return {
+    pos: PLANE_C.clone().add(new THREE.Vector3(0, d * 1.2, 0.02)),
+    look: PLANE_C.clone(),
+  };
+}
+function snapshot() {
+  return { pos: camera.position.clone(), look: lookCur.clone() };
+}
+function lerpState(a, b, k) {
+  return {
+    pos: a.pos.clone().lerp(b.pos, k),
+    look: a.look.clone().lerp(b.look, k),
+  };
+}
+const easeInOut = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+function applyState(s) {
+  camera.position.copy(s.pos);
+  lookCur.copy(s.look);
+  camera.lookAt(lookCur);
+}
+
+function startAnim(toZoom) {
+  zoomed = toZoom;
+  anim = {
+    from: snapshot(),
+    mid: topState(),
+    to: toZoom ? zoomState() : homeState(),
+    t: 0,
+  };
+  hint.style.opacity = 0;
+  backBtn.style.display = 'none';
+  hideHotspots();
+}
+
+/* ───────── 클릭: 전투기 확대 / 돌아가기 ───────── */
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+renderer.domElement.addEventListener('click', e => {
+  if (anim || zoomed) return;
+  mouse.x = (e.clientX / innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  if (raycaster.intersectObject(hitMesh, false).length > 0) startAnim(true);
+});
+
+backBtn.addEventListener('click', () => { if (!anim) startAnim(false); });
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  if (!zoomed && !anim) {
+    PLANE_C = computePlaneCenter();
+    planeRoot.position.copy(PLANE_C);
+  }
+});
+
+/* ───────── 애니메이션 루프 ───────── */
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = clock.getDelta();
+  const t = clock.elapsedTime;
+
+  const pos = seaGeo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    pos.setY(i, swellY(seaBase[i * 3], seaBase[i * 3 + 2], t));
+  }
+  pos.needsUpdate = true;
+  seaGeo.computeVertexNormals();
+
+  waterNormal.offset.x += dt * 0.012;
+  waterNormal.offset.y += dt * 0.008;
+
+  cloudTex.offset.x += dt * 0.004;
+  cloudTex2.offset.x += dt * 0.007;
+
+  sky.position.copy(camera.position);
+
+  planeBody.position.y = Math.sin(t * 1.2) * 0.12;
+  planeBody.rotation.z = Math.sin(t * 0.8) * 0.03;
+
+  if (anim) {
+    anim.t = Math.min(anim.t + dt / ANIM_TIME, 1);
+    const s = anim.t < 0.5
+      ? lerpState(anim.from, anim.mid, easeInOut(anim.t * 2))
+      : lerpState(anim.mid, anim.to, easeInOut((anim.t - 0.5) * 2));
+    applyState(s);
+    if (anim.t >= 1) {
+      anim = null;
+      if (zoomed) {
+        backBtn.style.display = 'block';
+        updateHotspots();
+      }
+    }
+  } else {
+    applyState(zoomed ? zoomState() : homeState());
+    if (zoomed) updateHotspots();
+  }
+
+  renderer.render(scene, camera);
+}
+
+hint.style.opacity = 1;
+animate();
+</script>
+</body>
+</html>
